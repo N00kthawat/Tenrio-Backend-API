@@ -6,6 +6,7 @@ import {
 import { Prisma, type User } from '@prisma/client';
 import {
   randomBytes,
+  createHash,
   scrypt as scryptCallback,
   type BinaryLike,
   type ScryptOptions,
@@ -14,11 +15,15 @@ import { promisify } from 'node:util';
 
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthUserResponseDto } from './dto/auth-user-response.dto';
+import { RegisterResponseDto } from './dto/register-response.dto';
 import { RegisterDto } from './dto/register.dto';
+import { VerifyEmailDto } from './dto/verify-email.dto';
 
 const MIN_PASSWORD_LENGTH = 12;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const SCRYPT_KEY_LENGTH = 64;
+const VERIFICATION_TOKEN_BYTES = 32;
+const VERIFICATION_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 const SCRYPT_OPTIONS: ScryptOptions = {
   N: 16384,
   r: 8,
@@ -38,7 +43,7 @@ const scryptAsync = promisify(scryptCallback) as ScryptAsync;
 export class AuthService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async register(registerDto: RegisterDto): Promise<AuthUserResponseDto> {
+  async register(registerDto: RegisterDto): Promise<RegisterResponseDto> {
     const email = this.normalizeEmail(registerDto.email);
 
     this.validateEmail(email);
@@ -55,15 +60,35 @@ export class AuthService {
     const passwordHash = await this.hashPassword(registerDto.password);
 
     try {
-      const user = await this.prisma.user.create({
-        data: {
-          email,
-          passwordHash,
-          emailVerifiedAt: null,
-        },
-      });
+      const { user, verificationToken } = await this.prisma.$transaction(
+        async (tx) => {
+          const user = await tx.user.create({
+            data: {
+              email,
+              passwordHash,
+              emailVerifiedAt: null,
+            },
+          });
+          const verificationToken = this.generateVerificationToken();
 
-      return this.toSafeUserResponse(user);
+          await tx.emailVerificationToken.create({
+            data: {
+              userId: user.id,
+              tokenHash: this.hashVerificationToken(verificationToken),
+              expiresAt: this.getVerificationTokenExpiresAt(),
+            },
+          });
+
+          return { user, verificationToken };
+        },
+      );
+
+      return {
+        ...this.toSafeUserResponse(user),
+        ...(this.shouldExposeDevelopmentToken()
+          ? { verificationToken }
+          : {}),
+      };
     } catch (error) {
       if (
         error instanceof Prisma.PrismaClientKnownRequestError &&
@@ -74,6 +99,62 @@ export class AuthService {
 
       throw error;
     }
+  }
+
+  async verifyEmail(
+    verifyEmailDto: VerifyEmailDto,
+  ): Promise<AuthUserResponseDto> {
+    const token = this.validateVerificationToken(verifyEmailDto.token);
+    const tokenHash = this.hashVerificationToken(token);
+    const tokenRecord = await this.prisma.emailVerificationToken.findUnique({
+      where: { tokenHash },
+      include: { user: true },
+    });
+
+    if (!tokenRecord) {
+      throw new BadRequestException('Verification token is invalid.');
+    }
+
+    if (tokenRecord.usedAt) {
+      throw new BadRequestException(
+        'Verification token has already been used.',
+      );
+    }
+
+    const now = new Date();
+
+    if (tokenRecord.expiresAt <= now) {
+      throw new BadRequestException('Verification token has expired.');
+    }
+
+    const user = await this.prisma.$transaction(async (tx) => {
+      const markUsedResult = await tx.emailVerificationToken.updateMany({
+        where: {
+          id: tokenRecord.id,
+          usedAt: null,
+        },
+        data: {
+          usedAt: now,
+        },
+      });
+
+      if (markUsedResult.count !== 1) {
+        throw new BadRequestException(
+          'Verification token has already been used.',
+        );
+      }
+
+      if (tokenRecord.user.emailVerifiedAt) {
+        return tokenRecord.user;
+      }
+
+      return tx.user.update({
+        where: { id: tokenRecord.userId },
+        data: { emailVerifiedAt: now },
+      });
+    });
+
+    return this.toSafeUserResponse(user);
   }
 
   private normalizeEmail(email: unknown): string {
@@ -119,6 +200,30 @@ export class AuthService {
       salt.toString('base64url'),
       derivedKey.toString('base64url'),
     ].join('$');
+  }
+
+  private generateVerificationToken(): string {
+    return randomBytes(VERIFICATION_TOKEN_BYTES).toString('base64url');
+  }
+
+  private hashVerificationToken(token: string): string {
+    return createHash('sha256').update(token).digest('hex');
+  }
+
+  private getVerificationTokenExpiresAt(): Date {
+    return new Date(Date.now() + VERIFICATION_TOKEN_TTL_MS);
+  }
+
+  private validateVerificationToken(token: unknown): string {
+    if (typeof token !== 'string' || token.trim().length === 0) {
+      throw new BadRequestException('Verification token is required.');
+    }
+
+    return token.trim();
+  }
+
+  private shouldExposeDevelopmentToken(): boolean {
+    return process.env.NODE_ENV !== 'production';
   }
 
   private toSafeUserResponse(user: User): AuthUserResponseDto {
