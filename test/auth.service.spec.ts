@@ -2,6 +2,8 @@ import { BadRequestException, ConflictException } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 
 import { AuthService } from '../src/auth/auth.service';
+import { EmailService } from '../src/email/email.service';
+import { SendEmailInput } from '../src/email/email-provider';
 import { PrismaService } from '../src/prisma/prisma.service';
 
 type UserRecord = {
@@ -192,7 +194,27 @@ class EmailVerificationTokenDelegateMock {
   }
 }
 
+class EmailServiceMock {
+  readonly sentEmails: SendEmailInput[] = [];
+  shouldFail = false;
+
+  sendEmail(input: SendEmailInput): Promise<void> {
+    this.sentEmails.push(input);
+
+    if (this.shouldFail) {
+      return Promise.reject(new Error('Email failed.'));
+    }
+
+    return Promise.resolve();
+  }
+}
+
 describe('AuthService', () => {
+  beforeEach(() => {
+    process.env.NODE_ENV = 'test';
+    process.env.CUSTOMER_WEB_URL = 'http://localhost:3000';
+  });
+
   const hashToken = (token: string): string => {
     return createHash('sha256').update(token).digest('hex');
   };
@@ -201,9 +223,11 @@ describe('AuthService', () => {
     service: AuthService;
     userDelegate: UserDelegateMock;
     tokenDelegate: EmailVerificationTokenDelegateMock;
+    emailService: EmailServiceMock;
   } => {
     const userDelegate = new UserDelegateMock();
     const tokenDelegate = new EmailVerificationTokenDelegateMock(userDelegate);
+    const emailService = new EmailServiceMock();
     const tx: TransactionMock = {
       user: userDelegate,
       emailVerificationToken: tokenDelegate,
@@ -217,14 +241,16 @@ describe('AuthService', () => {
     } as unknown as PrismaService;
 
     return {
-      service: new AuthService(prisma),
+      service: new AuthService(prisma, emailService as unknown as EmailService),
       userDelegate,
       tokenDelegate,
+      emailService,
     };
   };
 
   it('registers a user with normalized email, safe response, and token hash', async () => {
-    const { service, userDelegate, tokenDelegate } = createService();
+    const { service, userDelegate, tokenDelegate, emailService } =
+      createService();
 
     const response = await service.register({
       email: '  CUSTOMER@Example.COM  ',
@@ -251,6 +277,20 @@ describe('AuthService', () => {
       response.verificationToken,
     );
     expect(tokenDelegate.records[0]?.tokenHash).toMatch(/^[a-f0-9]{64}$/);
+    expect(emailService.sentEmails).toHaveLength(1);
+    expect(emailService.sentEmails[0]?.to).toBe('customer@example.com');
+    expect(emailService.sentEmails[0]?.subject).toBe(
+      'Verify your Tenrio email address',
+    );
+    expect(emailService.sentEmails[0]?.html).toContain(
+      `token=${response.verificationToken}`,
+    );
+    expect(emailService.sentEmails[0]?.text).toContain(
+      `token=${response.verificationToken}`,
+    );
+    expect(emailService.sentEmails[0]?.html).not.toContain(
+      tokenDelegate.records[0]?.tokenHash ?? '',
+    );
   });
 
   it('rejects duplicate email', async () => {
@@ -347,5 +387,29 @@ describe('AuthService', () => {
     await expect(service.verifyEmail({ token })).rejects.toThrow(
       BadRequestException,
     );
+  });
+
+  it('handles email sending failures without creating duplicate users or tokens', async () => {
+    const { service, userDelegate, tokenDelegate, emailService } =
+      createService();
+
+    emailService.shouldFail = true;
+
+    await expect(
+      service.register({
+        email: 'customer@example.com',
+        password: 'long-enough-password',
+      }),
+    ).rejects.toThrow('Registration succeeded');
+
+    await expect(
+      service.register({
+        email: 'customer@example.com',
+        password: 'long-enough-password',
+      }),
+    ).rejects.toThrow(ConflictException);
+
+    expect(userDelegate.records).toHaveLength(1);
+    expect(tokenDelegate.records).toHaveLength(1);
   });
 });

@@ -2,6 +2,7 @@ import {
   BadRequestException,
   ConflictException,
   Injectable,
+  ServiceUnavailableException,
 } from '@nestjs/common';
 import { Prisma, type User } from '@prisma/client';
 import {
@@ -13,6 +14,7 @@ import {
 } from 'node:crypto';
 import { promisify } from 'node:util';
 
+import { EmailService } from '../email/email.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthUserResponseDto } from './dto/auth-user-response.dto';
 import { RegisterResponseDto } from './dto/register-response.dto';
@@ -41,7 +43,10 @@ const scryptAsync = promisify(scryptCallback) as ScryptAsync;
 
 @Injectable()
 export class AuthService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly emailService: EmailService,
+  ) {}
 
   async register(registerDto: RegisterDto): Promise<RegisterResponseDto> {
     const email = this.normalizeEmail(registerDto.email);
@@ -82,6 +87,8 @@ export class AuthService {
           return { user, verificationToken };
         },
       );
+
+      await this.sendVerificationEmail(user.email, verificationToken);
 
       return {
         ...this.toSafeUserResponse(user),
@@ -224,6 +231,44 @@ export class AuthService {
 
   private shouldExposeDevelopmentToken(): boolean {
     return process.env.NODE_ENV !== 'production';
+  }
+
+  private async sendVerificationEmail(
+    email: string,
+    verificationToken: string,
+  ): Promise<void> {
+    const verificationUrl = this.buildVerificationUrl(verificationToken);
+
+    try {
+      await this.emailService.sendEmail({
+        to: email,
+        subject: 'Verify your Tenrio email address',
+        html: [
+          '<p>Welcome to Tenrio.</p>',
+          '<p>Please verify your email address to continue.</p>',
+          `<p><a href="${verificationUrl}">Verify email</a></p>`,
+        ].join(''),
+        text: `Verify your Tenrio email address: ${verificationUrl}`,
+      });
+    } catch {
+      throw new ServiceUnavailableException(
+        'Registration succeeded, but verification email could not be sent.',
+      );
+    }
+  }
+
+  private buildVerificationUrl(verificationToken: string): string {
+    const customerWebUrl = process.env.CUSTOMER_WEB_URL;
+
+    if (!customerWebUrl) {
+      throw new ServiceUnavailableException('Customer web URL is not configured.');
+    }
+
+    const url = new URL('/verify-email', customerWebUrl);
+
+    url.searchParams.set('token', verificationToken);
+
+    return url.toString();
   }
 
   private toSafeUserResponse(user: User): AuthUserResponseDto {
