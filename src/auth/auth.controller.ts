@@ -91,6 +91,29 @@ export class AuthController {
     );
   }
 
+  @Post('logout')
+  @HttpCode(HttpStatus.OK)
+  @ApiOkResponse({
+    description: 'Customer logged out successfully.',
+  })
+  async logout(
+    @Req() request: Request,
+    @Res({ passthrough: true }) response: Response,
+  ): Promise<void> {
+    const sessionToken = this.getCookieValue(request, SESSION_COOKIE_NAME);
+
+    if (sessionToken) {
+      await this.authService.logout(sessionToken);
+    }
+
+    response.clearCookie(SESSION_COOKIE_NAME, {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: process.env.NODE_ENV === 'production',
+      path: '/',
+    });
+  }
+
   private getCookieValue(request: Request, name: string): string | undefined {
     const cookieHeader = request.headers.cookie;
 

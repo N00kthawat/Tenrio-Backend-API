@@ -275,6 +275,18 @@ class SessionDelegateMock {
       user,
     };
   }
+
+  update(args: { where: { id: string }; data: { revokedAt: Date } }): Promise<SessionRecord> {
+    const session = this.records.find((record) => record.id === args.where.id);
+
+    if (!session) {
+      throw new Error('Test session not found.');
+    }
+
+    session.revokedAt = args.data.revokedAt;
+
+    return Promise.resolve(session);
+  }
 }
 
 class EmailServiceMock {
@@ -609,5 +621,42 @@ describe('AuthService', () => {
     await expect(
       service.getCurrentUser(loginResult.sessionToken),
     ).rejects.toThrow(UnauthorizedException);
+  });
+
+  it('revokes a valid session on logout', async () => {
+    const { service, sessionDelegate } = createService();
+
+    await registerAndVerify(service);
+    const loginResult = await service.login({
+      email: 'customer@example.com',
+      password: 'long-enough-password',
+    });
+
+    await service.logout(loginResult.sessionToken);
+
+    const session = sessionDelegate.records[0];
+    expect(session?.revokedAt).toBeInstanceOf(Date);
+
+    await expect(
+      service.getCurrentUser(loginResult.sessionToken),
+    ).rejects.toThrow(UnauthorizedException);
+  });
+
+  it('handles logout with an invalid token safely', async () => {
+    const { service } = createService();
+    await expect(service.logout('invalid-session-token')).resolves.not.toThrow();
+  });
+
+  it('handles calling logout more than once safely', async () => {
+    const { service } = createService();
+
+    await registerAndVerify(service);
+    const loginResult = await service.login({
+      email: 'customer@example.com',
+      password: 'long-enough-password',
+    });
+
+    await service.logout(loginResult.sessionToken);
+    await expect(service.logout(loginResult.sessionToken)).resolves.not.toThrow();
   });
 });

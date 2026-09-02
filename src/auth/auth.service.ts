@@ -246,6 +246,26 @@ export class AuthService {
     return this.toSafeUserResponse(session.user);
   }
 
+  async logout(sessionToken: unknown): Promise<void> {
+    if (typeof sessionToken !== 'string' || sessionToken.trim().length === 0) {
+      return;
+    }
+
+    const token = sessionToken.trim();
+    const tokenHash = this.hashSessionToken(token);
+
+    const session = await this.prisma.session.findUnique({
+      where: { tokenHash },
+    });
+
+    if (session && !session.revokedAt) {
+      await this.prisma.session.update({
+        where: { id: session.id },
+        data: { revokedAt: new Date() },
+      });
+    }
+  }
+
   private normalizeEmail(email: unknown): string {
     if (typeof email !== 'string') {
       throw new BadRequestException('Email is required.');
