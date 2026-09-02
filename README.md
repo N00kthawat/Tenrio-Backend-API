@@ -24,7 +24,7 @@ npm install
 npm run start:dev
 ```
 
-The API starts on `http://localhost:3000`.
+The API starts on `http://localhost:4000`.
 
 ## Endpoints
 
