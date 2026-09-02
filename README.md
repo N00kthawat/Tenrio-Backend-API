@@ -6,6 +6,16 @@ Initial NestJS-based backend API skeleton for Tenrio.
 
 - Node.js 22+
 - npm 11+
+- PostgreSQL
+
+## Configuration
+
+Create a local `.env` file from `.env.example` and set `DATABASE_URL` for your
+PostgreSQL database. Do not commit the `.env` file.
+
+```bash
+cp .env.example .env
+```
 
 ## Run
 
@@ -20,6 +30,13 @@ The API starts on `http://localhost:3000`.
 
 - `GET /v1/health`
 - Swagger docs: `GET /v1/docs`
+
+## Prisma
+
+```bash
+npx prisma validate
+npx prisma generate
+```
 
 ## Quality Checks
 
