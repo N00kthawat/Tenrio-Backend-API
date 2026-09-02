@@ -19,7 +19,7 @@ async function bootstrap(): Promise<void> {
 
   SwaggerModule.setup('v1/docs', app, swaggerDocument);
 
-  const port = process.env.PORT ? Number(process.env.PORT) : 3000;
+  const port = process.env.PORT ? Number(process.env.PORT) : 4000;
   const host = process.env.HOST ?? '127.0.0.1';
 
   await app.listen(port, host);
