@@ -1,4 +1,8 @@
-import { BadRequestException, ConflictException } from '@nestjs/common';
+import {
+  BadRequestException,
+  ConflictException,
+  UnauthorizedException,
+} from '@nestjs/common';
 import { createHash } from 'node:crypto';
 
 import { AuthService } from '../src/auth/auth.service';
@@ -21,6 +25,15 @@ type EmailVerificationTokenRecord = {
   tokenHash: string;
   expiresAt: Date;
   usedAt: Date | null;
+  createdAt: Date;
+};
+
+type SessionRecord = {
+  id: string;
+  userId: string;
+  tokenHash: string;
+  expiresAt: Date;
+  revokedAt: Date | null;
   createdAt: Date;
 };
 
@@ -75,13 +88,35 @@ type UpdateManyTokenArgs = {
   };
 };
 
+type CreateSessionArgs = {
+  data: {
+    userId: string;
+    tokenHash: string;
+    expiresAt: Date;
+  };
+};
+
+type FindUniqueSessionArgs = {
+  where: {
+    tokenHash: string;
+  };
+  include: {
+    user: true;
+  };
+};
+
 type TokenWithUser = EmailVerificationTokenRecord & {
+  user: UserRecord;
+};
+
+type SessionWithUser = SessionRecord & {
   user: UserRecord;
 };
 
 type TransactionMock = {
   user: UserDelegateMock;
   emailVerificationToken: EmailVerificationTokenDelegateMock;
+  session: SessionDelegateMock;
 };
 
 class UserDelegateMock {
@@ -194,6 +229,54 @@ class EmailVerificationTokenDelegateMock {
   }
 }
 
+class SessionDelegateMock {
+  private nextId = 1;
+  readonly records: SessionRecord[] = [];
+
+  constructor(private readonly userDelegate: UserDelegateMock) {}
+
+  create(args: CreateSessionArgs): Promise<SessionRecord> {
+    const session: SessionRecord = {
+      id: `session_${this.nextId.toString()}`,
+      userId: args.data.userId,
+      tokenHash: args.data.tokenHash,
+      expiresAt: args.data.expiresAt,
+      revokedAt: null,
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+    };
+
+    this.nextId += 1;
+    this.records.push(session);
+
+    return Promise.resolve(session);
+  }
+
+  async findUnique(
+    args: FindUniqueSessionArgs,
+  ): Promise<SessionWithUser | null> {
+    const session =
+      this.records.find((record) => record.tokenHash === args.where.tokenHash) ??
+      null;
+
+    if (!session) {
+      return null;
+    }
+
+    const user = await this.userDelegate.findUnique({
+      where: { id: session.userId },
+    });
+
+    if (!user) {
+      return null;
+    }
+
+    return {
+      ...session,
+      user,
+    };
+  }
+}
+
 class EmailServiceMock {
   readonly sentEmails: SendEmailInput[] = [];
   shouldFail = false;
@@ -223,18 +306,22 @@ describe('AuthService', () => {
     service: AuthService;
     userDelegate: UserDelegateMock;
     tokenDelegate: EmailVerificationTokenDelegateMock;
+    sessionDelegate: SessionDelegateMock;
     emailService: EmailServiceMock;
   } => {
     const userDelegate = new UserDelegateMock();
     const tokenDelegate = new EmailVerificationTokenDelegateMock(userDelegate);
+    const sessionDelegate = new SessionDelegateMock(userDelegate);
     const emailService = new EmailServiceMock();
     const tx: TransactionMock = {
       user: userDelegate,
       emailVerificationToken: tokenDelegate,
+      session: sessionDelegate,
     };
     const prisma = {
       user: userDelegate,
       emailVerificationToken: tokenDelegate,
+      session: sessionDelegate,
       $transaction: <T>(
         callback: (transaction: TransactionMock) => Promise<T>,
       ) => callback(tx),
@@ -244,8 +331,23 @@ describe('AuthService', () => {
       service: new AuthService(prisma, emailService as unknown as EmailService),
       userDelegate,
       tokenDelegate,
+      sessionDelegate,
       emailService,
     };
+  };
+
+  const registerAndVerify = async (
+    service: AuthService,
+    email = 'customer@example.com',
+  ): Promise<void> => {
+    const registerResponse = await service.register({
+      email,
+      password: 'long-enough-password',
+    });
+
+    await service.verifyEmail({
+      token: registerResponse.verificationToken ?? '',
+    });
   };
 
   it('registers a user with normalized email, safe response, and token hash', async () => {
@@ -411,5 +513,101 @@ describe('AuthService', () => {
 
     expect(userDelegate.records).toHaveLength(1);
     expect(tokenDelegate.records).toHaveLength(1);
+  });
+
+  it('logs in a verified user and stores only the session token hash', async () => {
+    const { service, sessionDelegate } = createService();
+
+    await registerAndVerify(service);
+
+    const loginResult = await service.login({
+      email: '  CUSTOMER@Example.COM ',
+      password: 'long-enough-password',
+    });
+
+    expect(loginResult.user.email).toBe('customer@example.com');
+    expect('passwordHash' in loginResult.user).toBe(false);
+    expect(loginResult.sessionToken).toEqual(expect.any(String));
+    expect(sessionDelegate.records).toHaveLength(1);
+    expect(sessionDelegate.records[0]?.tokenHash).not.toBe(
+      loginResult.sessionToken,
+    );
+    expect(sessionDelegate.records[0]?.tokenHash).toMatch(/^[a-f0-9]{64}$/);
+  });
+
+  it('rejects invalid login credentials safely', async () => {
+    const { service, sessionDelegate } = createService();
+
+    await registerAndVerify(service);
+
+    await expect(
+      service.login({
+        email: 'customer@example.com',
+        password: 'wrong-password',
+      }),
+    ).rejects.toThrow(UnauthorizedException);
+    expect(sessionDelegate.records).toHaveLength(0);
+  });
+
+  it('rejects unverified user login without creating a session', async () => {
+    const { service, sessionDelegate } = createService();
+
+    await service.register({
+      email: 'customer@example.com',
+      password: 'long-enough-password',
+    });
+
+    await expect(
+      service.login({
+        email: 'customer@example.com',
+        password: 'long-enough-password',
+      }),
+    ).rejects.toThrow(UnauthorizedException);
+    expect(sessionDelegate.records).toHaveLength(0);
+  });
+
+  it('returns the current user for a valid session', async () => {
+    const { service } = createService();
+
+    await registerAndVerify(service);
+    const loginResult = await service.login({
+      email: 'customer@example.com',
+      password: 'long-enough-password',
+    });
+
+    const response = await service.getCurrentUser(loginResult.sessionToken);
+
+    expect(response.email).toBe('customer@example.com');
+    expect(response.emailVerifiedAt).toBeInstanceOf(Date);
+    expect('passwordHash' in response).toBe(false);
+  });
+
+  it('rejects invalid sessions', async () => {
+    const { service } = createService();
+
+    await expect(service.getCurrentUser('invalid-session-token')).rejects.toThrow(
+      UnauthorizedException,
+    );
+  });
+
+  it('rejects expired sessions', async () => {
+    const { service, sessionDelegate } = createService();
+
+    await registerAndVerify(service);
+    const loginResult = await service.login({
+      email: 'customer@example.com',
+      password: 'long-enough-password',
+    });
+    const session = sessionDelegate.records[0];
+
+    if (!session) {
+      throw new Error('Expected test session to exist.');
+    }
+
+    session.expiresAt = new Date('2025-01-01T00:00:00.000Z');
+
+    await expect(
+      service.getCurrentUser(loginResult.sessionToken),
+    ).rejects.toThrow(UnauthorizedException);
   });
 });

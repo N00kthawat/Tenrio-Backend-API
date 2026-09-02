@@ -3,11 +3,13 @@ import {
   ConflictException,
   Injectable,
   ServiceUnavailableException,
+  UnauthorizedException,
 } from '@nestjs/common';
 import { Prisma, type User } from '@prisma/client';
 import {
   randomBytes,
   createHash,
+  timingSafeEqual,
   scrypt as scryptCallback,
   type BinaryLike,
   type ScryptOptions,
@@ -17,6 +19,7 @@ import { promisify } from 'node:util';
 import { EmailService } from '../email/email.service';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthUserResponseDto } from './dto/auth-user-response.dto';
+import { LoginDto } from './dto/login.dto';
 import { RegisterResponseDto } from './dto/register-response.dto';
 import { RegisterDto } from './dto/register.dto';
 import { VerifyEmailDto } from './dto/verify-email.dto';
@@ -26,6 +29,9 @@ const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const SCRYPT_KEY_LENGTH = 64;
 const VERIFICATION_TOKEN_BYTES = 32;
 const VERIFICATION_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+const SESSION_TOKEN_BYTES = 32;
+const DEFAULT_SESSION_TTL_DAYS = 7;
+const SESSION_TTL_MS_PER_DAY = 24 * 60 * 60 * 1000;
 const SCRYPT_OPTIONS: ScryptOptions = {
   N: 16384,
   r: 8,
@@ -40,6 +46,12 @@ type ScryptAsync = (
 ) => Promise<Buffer>;
 
 const scryptAsync = promisify(scryptCallback) as ScryptAsync;
+
+export type LoginResult = {
+  user: AuthUserResponseDto;
+  sessionToken: string;
+  sessionExpiresAt: Date;
+};
 
 @Injectable()
 export class AuthService {
@@ -164,6 +176,76 @@ export class AuthService {
     return this.toSafeUserResponse(user);
   }
 
+  async login(loginDto: LoginDto): Promise<LoginResult> {
+    const email = this.normalizeEmail(loginDto.email);
+
+    this.validateEmail(email);
+
+    if (typeof loginDto.password !== 'string') {
+      throw new UnauthorizedException('Invalid email or password.');
+    }
+
+    const user = await this.prisma.user.findUnique({
+      where: { email },
+    });
+
+    if (!user) {
+      throw new UnauthorizedException('Invalid email or password.');
+    }
+
+    const passwordIsValid = await this.verifyPassword(
+      loginDto.password,
+      user.passwordHash,
+    );
+
+    if (!passwordIsValid) {
+      throw new UnauthorizedException('Invalid email or password.');
+    }
+
+    if (!user.emailVerifiedAt) {
+      throw new UnauthorizedException('Email address is not verified.');
+    }
+
+    const sessionToken = this.generateSessionToken();
+    const sessionExpiresAt = this.getSessionExpiresAt();
+
+    await this.prisma.session.create({
+      data: {
+        userId: user.id,
+        tokenHash: this.hashSessionToken(sessionToken),
+        expiresAt: sessionExpiresAt,
+      },
+    });
+
+    return {
+      user: this.toSafeUserResponse(user),
+      sessionToken,
+      sessionExpiresAt,
+    };
+  }
+
+  async getCurrentUser(sessionToken: unknown): Promise<AuthUserResponseDto> {
+    const token = this.validateSessionToken(sessionToken);
+    const session = await this.prisma.session.findUnique({
+      where: {
+        tokenHash: this.hashSessionToken(token),
+      },
+      include: {
+        user: true,
+      },
+    });
+
+    if (!session || session.revokedAt) {
+      throw new UnauthorizedException('Invalid session.');
+    }
+
+    if (session.expiresAt <= new Date()) {
+      throw new UnauthorizedException('Invalid session.');
+    }
+
+    return this.toSafeUserResponse(session.user);
+  }
+
   private normalizeEmail(email: unknown): string {
     if (typeof email !== 'string') {
       throw new BadRequestException('Email is required.');
@@ -209,12 +291,86 @@ export class AuthService {
     ].join('$');
   }
 
+  private async verifyPassword(
+    password: string,
+    passwordHash: string,
+  ): Promise<boolean> {
+    const [algorithm, nValue, rValue, pValue, salt, storedKey] =
+      passwordHash.split('$');
+
+    if (!algorithm || algorithm !== 'scrypt') {
+      return false;
+    }
+
+    const parsedOptions: ScryptOptions = {
+      N: this.parseScryptOption(nValue, 'N'),
+      r: this.parseScryptOption(rValue, 'r'),
+      p: this.parseScryptOption(pValue, 'p'),
+    };
+    const derivedKey = await scryptAsync(
+      password,
+      Buffer.from(salt ?? '', 'base64url'),
+      SCRYPT_KEY_LENGTH,
+      parsedOptions,
+    );
+    const storedKeyBuffer = Buffer.from(storedKey ?? '', 'base64url');
+
+    if (derivedKey.length !== storedKeyBuffer.length) {
+      return false;
+    }
+
+    return timingSafeEqual(derivedKey, storedKeyBuffer);
+  }
+
+  private parseScryptOption(
+    value: string | undefined,
+    expectedKey: 'N' | 'r' | 'p',
+  ): number {
+    const [key, rawValue] = value?.split('=') ?? [];
+
+    if (key !== expectedKey || !rawValue) {
+      throw new UnauthorizedException('Invalid email or password.');
+    }
+
+    const parsedValue = Number(rawValue);
+
+    if (!Number.isInteger(parsedValue) || parsedValue <= 0) {
+      throw new UnauthorizedException('Invalid email or password.');
+    }
+
+    return parsedValue;
+  }
+
   private generateVerificationToken(): string {
     return randomBytes(VERIFICATION_TOKEN_BYTES).toString('base64url');
   }
 
   private hashVerificationToken(token: string): string {
     return createHash('sha256').update(token).digest('hex');
+  }
+
+  private generateSessionToken(): string {
+    return randomBytes(SESSION_TOKEN_BYTES).toString('base64url');
+  }
+
+  private hashSessionToken(token: string): string {
+    return createHash('sha256').update(token).digest('hex');
+  }
+
+  private getSessionExpiresAt(): Date {
+    return new Date(Date.now() + this.getSessionTtlMs());
+  }
+
+  private getSessionTtlMs(): number {
+    const configuredDays = process.env.SESSION_TTL_DAYS
+      ? Number(process.env.SESSION_TTL_DAYS)
+      : DEFAULT_SESSION_TTL_DAYS;
+
+    if (!Number.isFinite(configuredDays) || configuredDays <= 0) {
+      return DEFAULT_SESSION_TTL_DAYS * SESSION_TTL_MS_PER_DAY;
+    }
+
+    return configuredDays * SESSION_TTL_MS_PER_DAY;
   }
 
   private getVerificationTokenExpiresAt(): Date {
@@ -224,6 +380,14 @@ export class AuthService {
   private validateVerificationToken(token: unknown): string {
     if (typeof token !== 'string' || token.trim().length === 0) {
       throw new BadRequestException('Verification token is required.');
+    }
+
+    return token.trim();
+  }
+
+  private validateSessionToken(token: unknown): string {
+    if (typeof token !== 'string' || token.trim().length === 0) {
+      throw new UnauthorizedException('Invalid session.');
     }
 
     return token.trim();
