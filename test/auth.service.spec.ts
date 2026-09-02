@@ -37,6 +37,15 @@ type SessionRecord = {
   createdAt: Date;
 };
 
+type PasswordResetTokenRecord = {
+  id: string;
+  userId: string;
+  tokenHash: string;
+  expiresAt: Date;
+  usedAt: Date | null;
+  createdAt: Date;
+};
+
 type FindUniqueUserArgs = {
   where: {
     email?: string;
@@ -57,7 +66,8 @@ type UpdateUserArgs = {
     id: string;
   };
   data: {
-    emailVerifiedAt: Date;
+    emailVerifiedAt?: Date;
+    passwordHash?: string;
   };
 };
 
@@ -113,10 +123,15 @@ type SessionWithUser = SessionRecord & {
   user: UserRecord;
 };
 
+type PasswordResetTokenWithUser = PasswordResetTokenRecord & {
+  user: UserRecord;
+};
+
 type TransactionMock = {
   user: UserDelegateMock;
   emailVerificationToken: EmailVerificationTokenDelegateMock;
   session: SessionDelegateMock;
+  passwordResetToken: PasswordResetTokenDelegateMock;
 };
 
 class UserDelegateMock {
@@ -162,8 +177,15 @@ class UserDelegateMock {
       throw new Error('Test user not found.');
     }
 
-    user.emailVerifiedAt = args.data.emailVerifiedAt;
-    user.updatedAt = args.data.emailVerifiedAt;
+    if (args.data.emailVerifiedAt !== undefined) {
+      user.emailVerifiedAt = args.data.emailVerifiedAt;
+      user.updatedAt = args.data.emailVerifiedAt;
+    }
+
+    if (args.data.passwordHash !== undefined) {
+      user.passwordHash = args.data.passwordHash;
+      user.updatedAt = new Date();
+    }
 
     return Promise.resolve(user);
   }
@@ -287,6 +309,74 @@ class SessionDelegateMock {
 
     return Promise.resolve(session);
   }
+
+  updateMany(args: { where: { userId: string; revokedAt: null }; data: { revokedAt: Date } }): Promise<{ count: number }> {
+    const sessions = this.records.filter((record) => record.userId === args.where.userId && record.revokedAt === null);
+
+    sessions.forEach(session => session.revokedAt = args.data.revokedAt);
+
+    return Promise.resolve({ count: sessions.length });
+  }
+}
+
+class PasswordResetTokenDelegateMock {
+  private nextId = 1;
+  readonly records: PasswordResetTokenRecord[] = [];
+
+  constructor(private readonly userDelegate: UserDelegateMock) {}
+
+  create(args: CreateTokenArgs): Promise<PasswordResetTokenRecord> {
+    const token: PasswordResetTokenRecord = {
+      id: `token_${this.nextId.toString()}`,
+      userId: args.data.userId,
+      tokenHash: args.data.tokenHash,
+      expiresAt: args.data.expiresAt,
+      usedAt: null,
+      createdAt: new Date('2026-01-01T00:00:00.000Z'),
+    };
+
+    this.nextId += 1;
+    this.records.push(token);
+
+    return Promise.resolve(token);
+  }
+
+  async findUnique(args: FindUniqueTokenArgs): Promise<PasswordResetTokenWithUser | null> {
+    const token =
+      this.records.find((record) => record.tokenHash === args.where.tokenHash) ??
+      null;
+
+    if (!token) {
+      return null;
+    }
+
+    const user = await this.userDelegate.findUnique({
+      where: { id: token.userId },
+    });
+
+    if (!user) {
+      return null;
+    }
+
+    return {
+      ...token,
+      user,
+    };
+  }
+
+  updateMany(args: UpdateManyTokenArgs): Promise<{ count: number }> {
+    const token = this.records.find((record) => {
+      return record.id === args.where.id && record.usedAt === args.where.usedAt;
+    });
+
+    if (!token) {
+      return Promise.resolve({ count: 0 });
+    }
+
+    token.usedAt = args.data.usedAt;
+
+    return Promise.resolve({ count: 1 });
+  }
 }
 
 class EmailServiceMock {
@@ -319,21 +409,25 @@ describe('AuthService', () => {
     userDelegate: UserDelegateMock;
     tokenDelegate: EmailVerificationTokenDelegateMock;
     sessionDelegate: SessionDelegateMock;
+    passwordResetTokenDelegate: PasswordResetTokenDelegateMock;
     emailService: EmailServiceMock;
   } => {
     const userDelegate = new UserDelegateMock();
     const tokenDelegate = new EmailVerificationTokenDelegateMock(userDelegate);
     const sessionDelegate = new SessionDelegateMock(userDelegate);
+    const passwordResetTokenDelegate = new PasswordResetTokenDelegateMock(userDelegate);
     const emailService = new EmailServiceMock();
     const tx: TransactionMock = {
       user: userDelegate,
       emailVerificationToken: tokenDelegate,
       session: sessionDelegate,
+      passwordResetToken: passwordResetTokenDelegate,
     };
     const prisma = {
       user: userDelegate,
       emailVerificationToken: tokenDelegate,
       session: sessionDelegate,
+      passwordResetToken: passwordResetTokenDelegate,
       $transaction: <T>(
         callback: (transaction: TransactionMock) => Promise<T>,
       ) => callback(tx),
@@ -344,6 +438,7 @@ describe('AuthService', () => {
       userDelegate,
       tokenDelegate,
       sessionDelegate,
+      passwordResetTokenDelegate,
       emailService,
     };
   };
@@ -658,5 +753,97 @@ describe('AuthService', () => {
 
     await service.logout(loginResult.sessionToken);
     await expect(service.logout(loginResult.sessionToken)).resolves.not.toThrow();
+  });
+
+  describe('forgot-password and reset-password', () => {
+    it('does not reveal account existence for non-existing emails', async () => {
+      const { service, emailService, passwordResetTokenDelegate } = createService();
+      
+      await expect(service.forgotPassword({ email: 'non-existing@example.com' })).resolves.not.toThrow();
+      expect(emailService.sentEmails).toHaveLength(0);
+      expect(passwordResetTokenDelegate.records).toHaveLength(0);
+    });
+
+    it('creates a reset token and sends an email for existing users without storing the raw token', async () => {
+      const { service, emailService, passwordResetTokenDelegate } = createService();
+      await registerAndVerify(service);
+      emailService.sentEmails.length = 0; // clear welcome email
+
+      await service.forgotPassword({ email: 'customer@example.com' });
+
+      expect(emailService.sentEmails).toHaveLength(1);
+      const emailContent = emailService.sentEmails[0]?.html ?? '';
+      expect(emailContent).toContain('reset-password?token=');
+      
+      // Extract raw token
+      const rawTokenMatch = emailContent.match(/token=([a-zA-Z0-9_-]+)/);
+      const rawToken = rawTokenMatch?.[1];
+      expect(rawToken).toBeDefined();
+
+      expect(passwordResetTokenDelegate.records).toHaveLength(1);
+      const record = passwordResetTokenDelegate.records[0];
+      
+      // Check that the raw token is not stored, only hash
+      expect(record?.tokenHash).not.toBe(rawToken);
+      expect(record?.tokenHash).toEqual(hashToken(rawToken!));
+    });
+
+    it('resets the password and revokes all active sessions', async () => {
+      const { service, emailService } = createService();
+      await registerAndVerify(service);
+      
+      const login1 = await service.login({ email: 'customer@example.com', password: 'long-enough-password' });
+      const login2 = await service.login({ email: 'customer@example.com', password: 'long-enough-password' });
+      
+      emailService.sentEmails.length = 0;
+      await service.forgotPassword({ email: 'customer@example.com' });
+      const rawToken = emailService.sentEmails[0]?.html?.match(/token=([a-zA-Z0-9_-]+)/)?.[1];
+
+      await expect(service.resetPassword({ token: rawToken!, newPassword: 'new-secure-password' })).resolves.not.toThrow();
+      
+      // Old password should fail
+      await expect(service.login({ email: 'customer@example.com', password: 'long-enough-password' })).rejects.toThrow(UnauthorizedException);
+      
+      // New password should work
+      await expect(service.login({ email: 'customer@example.com', password: 'new-secure-password' })).resolves.toBeDefined();
+      
+      // Old sessions should be revoked
+      await expect(service.getCurrentUser(login1.sessionToken)).rejects.toThrow(UnauthorizedException);
+      await expect(service.getCurrentUser(login2.sessionToken)).rejects.toThrow(UnauthorizedException);
+    });
+
+    it('rejects short passwords', async () => {
+      const { service, emailService } = createService();
+      await registerAndVerify(service);
+      emailService.sentEmails.length = 0;
+      await service.forgotPassword({ email: 'customer@example.com' });
+      const rawToken = emailService.sentEmails[0]?.html?.match(/token=([a-zA-Z0-9_-]+)/)?.[1];
+
+      await expect(service.resetPassword({ token: rawToken!, newPassword: 'short' })).rejects.toThrow(BadRequestException);
+    });
+
+    it('rejects expired tokens', async () => {
+      const { service, emailService, passwordResetTokenDelegate } = createService();
+      await registerAndVerify(service);
+      emailService.sentEmails.length = 0;
+      await service.forgotPassword({ email: 'customer@example.com' });
+      const rawToken = emailService.sentEmails[0]?.html?.match(/token=([a-zA-Z0-9_-]+)/)?.[1];
+
+      const record = passwordResetTokenDelegate.records[0];
+      record.expiresAt = new Date('2020-01-01T00:00:00.000Z');
+
+      await expect(service.resetPassword({ token: rawToken!, newPassword: 'new-secure-password' })).rejects.toThrow(BadRequestException);
+    });
+
+    it('rejects reused tokens', async () => {
+      const { service, emailService } = createService();
+      await registerAndVerify(service);
+      emailService.sentEmails.length = 0;
+      await service.forgotPassword({ email: 'customer@example.com' });
+      const rawToken = emailService.sentEmails[0]?.html?.match(/token=([a-zA-Z0-9_-]+)/)?.[1];
+
+      await service.resetPassword({ token: rawToken!, newPassword: 'new-secure-password' });
+      await expect(service.resetPassword({ token: rawToken!, newPassword: 'another-secure-password' })).rejects.toThrow(BadRequestException);
+    });
   });
 });

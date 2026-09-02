@@ -23,12 +23,16 @@ import { LoginDto } from './dto/login.dto';
 import { RegisterResponseDto } from './dto/register-response.dto';
 import { RegisterDto } from './dto/register.dto';
 import { VerifyEmailDto } from './dto/verify-email.dto';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
 
 const MIN_PASSWORD_LENGTH = 12;
 const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const SCRYPT_KEY_LENGTH = 64;
 const VERIFICATION_TOKEN_BYTES = 32;
 const VERIFICATION_TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
+const RESET_PASSWORD_TOKEN_BYTES = 32;
+const RESET_PASSWORD_TOKEN_TTL_MS = 60 * 60 * 1000;
 const SESSION_TOKEN_BYTES = 32;
 const DEFAULT_SESSION_TTL_DAYS = 7;
 const SESSION_TTL_MS_PER_DAY = 24 * 60 * 60 * 1000;
@@ -266,6 +270,93 @@ export class AuthService {
     }
   }
 
+  async forgotPassword(forgotPasswordDto: ForgotPasswordDto): Promise<void> {
+    const email = this.normalizeEmail(forgotPasswordDto.email);
+    this.validateEmail(email);
+
+    const user = await this.prisma.user.findUnique({
+      where: { email },
+    });
+
+    if (!user) {
+      return;
+    }
+
+    const resetToken = this.generateResetPasswordToken();
+    const tokenHash = this.hashResetPasswordToken(resetToken);
+
+    await this.prisma.passwordResetToken.create({
+      data: {
+        userId: user.id,
+        tokenHash,
+        expiresAt: this.getResetPasswordTokenExpiresAt(),
+      },
+    });
+
+    try {
+      await this.sendPasswordResetEmail(user.email, resetToken);
+    } catch {
+      // Ignore to prevent revealing email existence
+    }
+  }
+
+  async resetPassword(resetPasswordDto: ResetPasswordDto): Promise<void> {
+    const token = this.validateResetPasswordToken(resetPasswordDto.token);
+    this.validatePassword(resetPasswordDto.newPassword);
+
+    const tokenHash = this.hashResetPasswordToken(token);
+    const tokenRecord = await this.prisma.passwordResetToken.findUnique({
+      where: { tokenHash },
+      include: { user: true },
+    });
+
+    if (!tokenRecord) {
+      throw new BadRequestException('Reset token is invalid.');
+    }
+
+    if (tokenRecord.usedAt) {
+      throw new BadRequestException('Reset token has already been used.');
+    }
+
+    const now = new Date();
+    if (tokenRecord.expiresAt <= now) {
+      throw new BadRequestException('Reset token has expired.');
+    }
+
+    const passwordHash = await this.hashPassword(resetPasswordDto.newPassword);
+
+    await this.prisma.$transaction(async (tx) => {
+      const markUsedResult = await tx.passwordResetToken.updateMany({
+        where: {
+          id: tokenRecord.id,
+          usedAt: null,
+        },
+        data: {
+          usedAt: now,
+        },
+      });
+
+      if (markUsedResult.count !== 1) {
+        throw new BadRequestException('Reset token has already been used.');
+      }
+
+      await tx.user.update({
+        where: { id: tokenRecord.userId },
+        data: { passwordHash },
+      });
+
+      await tx.session.updateMany({
+        where: {
+          userId: tokenRecord.userId,
+          revokedAt: null,
+        },
+        data: {
+          revokedAt: now,
+        },
+      });
+    });
+  }
+
   private normalizeEmail(email: unknown): string {
     if (typeof email !== 'string') {
       throw new BadRequestException('Email is required.');
@@ -451,6 +542,55 @@ export class AuthService {
     const url = new URL('/verify-email', customerWebUrl);
 
     url.searchParams.set('token', verificationToken);
+
+    return url.toString();
+  }
+
+  private generateResetPasswordToken(): string {
+    return randomBytes(RESET_PASSWORD_TOKEN_BYTES).toString('base64url');
+  }
+
+  private hashResetPasswordToken(token: string): string {
+    return createHash('sha256').update(token).digest('hex');
+  }
+
+  private getResetPasswordTokenExpiresAt(): Date {
+    return new Date(Date.now() + RESET_PASSWORD_TOKEN_TTL_MS);
+  }
+
+  private validateResetPasswordToken(token: unknown): string {
+    if (typeof token !== 'string' || token.trim().length === 0) {
+      throw new BadRequestException('Reset token is required.');
+    }
+    return token.trim();
+  }
+
+  private async sendPasswordResetEmail(
+    email: string,
+    resetToken: string,
+  ): Promise<void> {
+    const resetUrl = this.buildPasswordResetUrl(resetToken);
+
+    await this.emailService.sendEmail({
+      to: email,
+      subject: 'Reset your Tenrio password',
+      html: [
+        '<p>We received a request to reset your password.</p>',
+        `<p><a href="${resetUrl}">Reset Password</a></p>`,
+      ].join(''),
+      text: `Reset your Tenrio password: ${resetUrl}`,
+    });
+  }
+
+  private buildPasswordResetUrl(resetToken: string): string {
+    const customerWebUrl = process.env.CUSTOMER_WEB_URL;
+
+    if (!customerWebUrl) {
+      throw new ServiceUnavailableException('Customer web URL is not configured.');
+    }
+
+    const url = new URL('/reset-password', customerWebUrl);
+    url.searchParams.set('token', resetToken);
 
     return url.toString();
   }

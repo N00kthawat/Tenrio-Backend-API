@@ -16,6 +16,8 @@ import { LoginDto } from './dto/login.dto';
 import { RegisterResponseDto } from './dto/register-response.dto';
 import { RegisterDto } from './dto/register.dto';
 import { VerifyEmailDto } from './dto/verify-email.dto';
+import { ForgotPasswordDto } from './dto/forgot-password.dto';
+import { ResetPasswordDto } from './dto/reset-password.dto';
 
 const SESSION_COOKIE_NAME = 'tenrio_session';
 
@@ -112,6 +114,27 @@ export class AuthController {
       secure: process.env.NODE_ENV === 'production',
       path: '/',
     });
+  }
+
+  @Post('forgot-password')
+  @HttpCode(HttpStatus.OK)
+  @ApiOkResponse({
+    description: 'If the email exists, a password reset link was sent.',
+  })
+  forgotPassword(@Body() forgotPasswordDto: ForgotPasswordDto): Promise<void> {
+    return this.authService.forgotPassword(forgotPasswordDto);
+  }
+
+  @Post('reset-password')
+  @HttpCode(HttpStatus.OK)
+  @ApiOkResponse({
+    description: 'Password reset successfully.',
+  })
+  @ApiBadRequestResponse({
+    description: 'Reset token is invalid, expired, or already used, or password is too short.',
+  })
+  resetPassword(@Body() resetPasswordDto: ResetPasswordDto): Promise<void> {
+    return this.authService.resetPassword(resetPasswordDto);
   }
 
   private getCookieValue(request: Request, name: string): string | undefined {
