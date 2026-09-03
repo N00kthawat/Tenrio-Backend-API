@@ -97,3 +97,17 @@ model OrganizationMember {
   @@unique([organizationId, userId])
   @@index([userId])
 }
+
+model Microsoft365Plan {
+  id                String   @id @default(cuid())
+  code              String   @unique
+  slug              String   @unique
+  name              String
+  featureKeys       String[]
+  isActive          Boolean
+  sortOrder         Int
+  providerProductId String?
+  providerSkuId     String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
