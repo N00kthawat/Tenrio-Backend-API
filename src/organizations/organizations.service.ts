@@ -3,6 +3,7 @@ import {
   ForbiddenException,
   Injectable,
   NotFoundException,
+  BadRequestException,
 } from '@nestjs/common';
 import { Prisma, Organization } from '@prisma/client';
 
@@ -119,6 +120,60 @@ export class OrganizationsService {
       throw new ForbiddenException(
         'Only owners can update organization profile.',
       );
+    }
+
+    if (updateOrganizationDto.name !== undefined) {
+      if (updateOrganizationDto.name === null) {
+        throw new BadRequestException('name cannot be null.');
+      }
+      if (typeof updateOrganizationDto.name !== 'string' || updateOrganizationDto.name.trim() === '') {
+        throw new BadRequestException('name must be a non-empty string.');
+      }
+    }
+
+    if (updateOrganizationDto.branchType !== undefined) {
+      if (
+        updateOrganizationDto.branchType !== null &&
+        updateOrganizationDto.branchType !== 'HEAD_OFFICE' &&
+        updateOrganizationDto.branchType !== 'BRANCH'
+      ) {
+        throw new BadRequestException('branchType must be HEAD_OFFICE, BRANCH, or null.');
+      }
+    }
+
+    if (updateOrganizationDto.billingEmail !== undefined) {
+      if (updateOrganizationDto.billingEmail !== null) {
+        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+        if (
+          typeof updateOrganizationDto.billingEmail !== 'string' ||
+          !emailRegex.test(updateOrganizationDto.billingEmail)
+        ) {
+          throw new BadRequestException('billingEmail must be a valid email or null.');
+        }
+      }
+    }
+
+    const optionalFields = [
+      'legalName',
+      'juristicRegistrationNumber',
+      'taxId',
+      'branchNumber',
+      'phoneNumber',
+      'addressLine',
+      'subdistrict',
+      'district',
+      'province',
+      'postalCode',
+      'country',
+    ] as const;
+
+    for (const field of optionalFields) {
+      const val = updateOrganizationDto[field];
+      if (val !== undefined && val !== null) {
+        if (typeof val !== 'string' || val.trim() === '') {
+          throw new BadRequestException(`${field} must be a non-empty string or null.`);
+        }
+      }
     }
 
     const updated = await this.prisma.organization.update({

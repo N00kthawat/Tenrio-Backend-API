@@ -108,8 +108,8 @@ class OrganizationMemberDelegateMock {
   }
 
   findUnique(args: { where: { organizationId_userId: { organizationId: string; userId: string } }; include?: { organization: boolean } }): Promise<OrganizationMemberRecord & { organization?: OrganizationRecord } | null> {
-    const member = this.records.find(r => 
-      r.organizationId === args.where.organizationId_userId.organizationId && 
+    const member = this.records.find(r =>
+      r.organizationId === args.where.organizationId_userId.organizationId &&
       r.userId === args.where.organizationId_userId.userId
     );
     if (!member) return Promise.resolve(null);
@@ -127,7 +127,7 @@ describe('OrganizationsService', () => {
   const createService = () => {
     const orgDelegate = new OrganizationDelegateMock();
     const memberDelegate = new OrganizationMemberDelegateMock(orgDelegate);
-    
+
     const tx = {
       organization: orgDelegate,
       organizationMember: memberDelegate,
@@ -159,7 +159,7 @@ describe('OrganizationsService', () => {
   it('allows authenticated user with 0 memberships to create Organization', async () => {
     const { service, orgDelegate, memberDelegate } = createService();
     const org = await service.create('user_1', { name: 'Acme Corp' });
-    
+
     expect(org.name).toBe('Acme Corp');
     expect(orgDelegate.records).toHaveLength(1);
     expect(memberDelegate.records).toHaveLength(1);
@@ -171,7 +171,7 @@ describe('OrganizationsService', () => {
   it('prevents user with >= 1 membership from creating another Organization', async () => {
     const { service } = createService();
     await service.create('user_1', { name: 'Acme Corp' });
-    
+
     await expect(service.create('user_1', { name: 'Another Corp' })).rejects.toThrow(ConflictException);
   });
 
@@ -179,9 +179,9 @@ describe('OrganizationsService', () => {
     const { service, orgDelegate, memberDelegate } = createService();
     // Force member creation to fail
     jest.spyOn(memberDelegate, 'create').mockRejectedValueOnce(new Error('Simulated failure'));
-    
+
     await expect(service.create('user_1', { name: 'Acme Corp' })).rejects.toThrow('Simulated failure');
-    
+
     expect(orgDelegate.records).toHaveLength(0); // Rolled back
   });
 
@@ -189,14 +189,14 @@ describe('OrganizationsService', () => {
     const { orgDelegate, memberDelegate } = createService();
     const org = await orgDelegate.create({ data: { name: 'Acme Corp' } });
     await memberDelegate.create({ data: { organizationId: org.id, userId: 'user_1', role: 'OWNER' } });
-    
+
     await expect(memberDelegate.create({ data: { organizationId: org.id, userId: 'user_1', role: 'MEMBER' } })).rejects.toThrow();
   });
 
   it('list returns only authorized Organizations', async () => {
     const { service, memberDelegate, orgDelegate } = createService();
     await service.create('user_1', { name: 'Acme Corp' });
-    
+
     // Manually add another org for a different user
     const org2 = await orgDelegate.create({ data: { name: 'Other Corp' } });
     await memberDelegate.create({ data: { organizationId: org2.id, userId: 'user_2', role: 'OWNER' } });
@@ -209,7 +209,7 @@ describe('OrganizationsService', () => {
   it('member may GET their Organization', async () => {
     const { service } = createService();
     const created = await service.create('user_1', { name: 'Acme Corp' });
-    
+
     const fetched = await service.findOne('user_1', created.id);
     expect(fetched.id).toBe(created.id);
     expect(fetched.name).toBe('Acme Corp');
@@ -222,12 +222,134 @@ describe('OrganizationsService', () => {
     await expect(service.findOne('user_2', created.id)).rejects.toThrow(NotFoundException);
   });
 
-  it('OWNER may PATCH Organization', async () => {
+  it('omitted legalName preserves existing value', async () => {
     const { service } = createService();
     const created = await service.create('user_1', { name: 'Acme Corp' });
-    
-    const updated = await service.update('user_1', created.id, { legalName: 'Acme Corp Ltd.' });
-    expect(updated.legalName).toBe('Acme Corp Ltd.');
+    await service.update('user_1', created.id, { legalName: 'Old Name' });
+
+    const updated = await service.update('user_1', created.id, { name: 'Acme Corp 2' }); // omitted legalName
+    expect(updated.legalName).toBe('Old Name');
+  });
+
+  it('legalName null clears existing value', async () => {
+    const { service } = createService();
+    const created = await service.create('user_1', { name: 'Acme Corp' });
+    await service.update('user_1', created.id, { legalName: 'Old Name' });
+
+    const updated = await service.update('user_1', created.id, { legalName: null });
+    expect(updated.legalName).toBeNull();
+  });
+
+  it('legalName valid string replaces value', async () => {
+    const { service } = createService();
+    const created = await service.create('user_1', { name: 'Acme Corp' });
+
+    const updated = await service.update('user_1', created.id, { legalName: 'New Name' });
+    expect(updated.legalName).toBe('New Name');
+  });
+
+  it('branchType omitted preserves existing value', async () => {
+    const { service } = createService();
+    const created = await service.create('user_1', { name: 'Acme Corp' });
+    await service.update('user_1', created.id, { branchType: 'HEAD_OFFICE' });
+
+    const updated = await service.update('user_1', created.id, { name: 'Acme Corp 2' }); // omitted branchType
+    expect(updated.branchType).toBe('HEAD_OFFICE');
+  });
+
+  it('branchType null clears existing value', async () => {
+    const { service } = createService();
+    const created = await service.create('user_1', { name: 'Acme Corp' });
+    await service.update('user_1', created.id, { branchType: 'HEAD_OFFICE' });
+
+    const updated = await service.update('user_1', created.id, { branchType: null });
+    expect(updated.branchType).toBeNull();
+  });
+
+  it('HEAD_OFFICE updates correctly', async () => {
+    const { service } = createService();
+    const created = await service.create('user_1', { name: 'Acme Corp' });
+
+    const updated = await service.update('user_1', created.id, { branchType: 'HEAD_OFFICE' });
+    expect(updated.branchType).toBe('HEAD_OFFICE');
+  });
+
+  it('BRANCH updates correctly', async () => {
+    const { service } = createService();
+    const created = await service.create('user_1', { name: 'Acme Corp' });
+
+    const updated = await service.update('user_1', created.id, { branchType: 'BRANCH' });
+    expect(updated.branchType).toBe('BRANCH');
+  });
+
+  it('invalid branchType is rejected', async () => {
+    const { service } = createService();
+    const created = await service.create('user_1', { name: 'Acme Corp' });
+
+    await expect(service.update('user_1', created.id, { branchType: 'OTHER' as unknown as 'HEAD_OFFICE' })).rejects.toThrow();
+  });
+
+  it('branchNumber null clears existing value', async () => {
+    const { service } = createService();
+    const created = await service.create('user_1', { name: 'Acme Corp' });
+    await service.update('user_1', created.id, { branchNumber: '00001' });
+
+    const updated = await service.update('user_1', created.id, { branchNumber: null });
+    expect(updated.branchNumber).toBeNull();
+  });
+
+  it('billingEmail null clears existing value', async () => {
+    const { service } = createService();
+    const created = await service.create('user_1', { name: 'Acme Corp' });
+    await service.update('user_1', created.id, { billingEmail: 'test@example.com' });
+
+    const updated = await service.update('user_1', created.id, { billingEmail: null });
+    expect(updated.billingEmail).toBeNull();
+  });
+
+  it('invalid billingEmail is rejected', async () => {
+    const { service } = createService();
+    const created = await service.create('user_1', { name: 'Acme Corp' });
+
+    await expect(service.update('user_1', created.id, { billingEmail: 'invalid-email' })).rejects.toThrow();
+  });
+
+  it('country null clears existing value', async () => {
+    const { service } = createService();
+    const created = await service.create('user_1', { name: 'Acme Corp' });
+    await service.update('user_1', created.id, { country: 'Thailand' });
+
+    const updated = await service.update('user_1', created.id, { country: null });
+    expect(updated.country).toBeNull();
+  });
+
+  it('name omitted preserves existing name', async () => {
+    const { service } = createService();
+    const created = await service.create('user_1', { name: 'Acme Corp' });
+
+    const updated = await service.update('user_1', created.id, { legalName: 'Acme Corp Ltd.' }); // omitted name
+    expect(updated.name).toBe('Acme Corp');
+  });
+
+  it('name null is rejected', async () => {
+    const { service } = createService();
+    const created = await service.create('user_1', { name: 'Acme Corp' });
+
+    await expect(service.update('user_1', created.id, { name: null as unknown as string })).rejects.toThrow();
+  });
+
+  it('blank name is rejected', async () => {
+    const { service } = createService();
+    const created = await service.create('user_1', { name: 'Acme Corp' });
+
+    await expect(service.update('user_1', created.id, { name: '' })).rejects.toThrow();
+  });
+
+  it('whitespace-only name is rejected', async () => {
+    const { service } = createService();
+    const created = await service.create('user_1', { name: 'Acme Corp' });
+
+    await expect(service.update('user_1', created.id, { name: '   ' })).rejects.toThrow();
   });
 
   it('OWNER may PATCH Organization juristicRegistrationNumber', async () => {
