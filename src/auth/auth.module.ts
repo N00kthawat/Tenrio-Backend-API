@@ -9,5 +9,6 @@ import { AuthService } from './auth.service';
   imports: [EmailModule, PrismaModule],
   controllers: [AuthController],
   providers: [AuthService],
+  exports: [AuthService],
 })
 export class AuthModule {}

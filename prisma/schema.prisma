@@ -17,6 +17,7 @@ model User {
   emailVerificationTokens EmailVerificationToken[]
   sessions                Session[]
   passwordResetTokens     PasswordResetToken[]
+  organizationMembers     OrganizationMember[]
 }
 
 model EmailVerificationToken {
@@ -59,4 +60,39 @@ model PasswordResetToken {
 
   @@index([userId])
   @@index([expiresAt])
+}
+
+model Organization {
+  id           String               @id @default(cuid())
+  name         String
+  legalName    String?
+  taxId        String?
+  branchType   String?
+  branchNumber String?
+  billingEmail String?
+  phoneNumber  String?
+  addressLine  String?
+  subdistrict  String?
+  district     String?
+  province     String?
+  postalCode   String?
+  country      String?
+  createdAt    DateTime             @default(now())
+  updatedAt    DateTime             @updatedAt
+  members      OrganizationMember[]
+}
+
+model OrganizationMember {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String
+  role           String
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, userId])
+  @@index([userId])
 }
