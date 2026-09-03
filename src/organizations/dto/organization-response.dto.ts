@@ -11,6 +11,9 @@ export class OrganizationResponseDto {
   legalName!: string | null;
 
   @ApiPropertyOptional()
+  juristicRegistrationNumber!: string | null;
+
+  @ApiPropertyOptional()
   taxId!: string | null;
 
   @ApiPropertyOptional()

@@ -7,6 +7,7 @@ type OrganizationRecord = {
   id: string;
   name: string;
   legalName: string | null;
+  juristicRegistrationNumber: string | null;
   taxId: string | null;
   branchType: string | null;
   branchNumber: string | null;
@@ -40,6 +41,7 @@ class OrganizationDelegateMock {
       id: `org_${this.nextId++}`,
       name: args.data.name,
       legalName: null,
+      juristicRegistrationNumber: null,
       taxId: null,
       branchType: null,
       branchNumber: null,
@@ -226,6 +228,14 @@ describe('OrganizationsService', () => {
     
     const updated = await service.update('user_1', created.id, { legalName: 'Acme Corp Ltd.' });
     expect(updated.legalName).toBe('Acme Corp Ltd.');
+  });
+
+  it('OWNER may PATCH Organization juristicRegistrationNumber', async () => {
+    const { service } = createService();
+    const created = await service.create('user_1', { name: 'Acme Corp' });
+
+    const updated = await service.update('user_1', created.id, { juristicRegistrationNumber: '0105562000000' });
+    expect(updated.juristicRegistrationNumber).toBe('0105562000000');
   });
 
   it('unrelated user cannot PATCH Organization', async () => {

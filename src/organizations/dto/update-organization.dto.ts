@@ -7,6 +7,9 @@ export class UpdateOrganizationDto {
   @ApiPropertyOptional({ description: 'The legal registered name of the organization' })
   legalName?: string;
 
+  @ApiPropertyOptional({ description: 'The juristic registration number' })
+  juristicRegistrationNumber?: string;
+
   @ApiPropertyOptional({ description: 'The tax identification number' })
   taxId?: string;
 

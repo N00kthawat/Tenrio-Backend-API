@@ -134,6 +134,7 @@ export class OrganizationsService {
       id: organization.id,
       name: organization.name,
       legalName: organization.legalName,
+      juristicRegistrationNumber: organization.juristicRegistrationNumber,
       taxId: organization.taxId,
       branchType: organization.branchType,
       branchNumber: organization.branchNumber,
